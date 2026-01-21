@@ -22,6 +22,7 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
 )
@@ -96,8 +97,9 @@ def dtensor_params_generator(
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        full_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
-        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, full_tensor)
+        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
             # Convert to target dtype
             yield (
@@ -106,6 +108,7 @@ def dtensor_params_generator(
             )
             del adapted_tensor
         del adapted_fqn_tensors
+        del merged_tensor
         del full_tensor
 
 
