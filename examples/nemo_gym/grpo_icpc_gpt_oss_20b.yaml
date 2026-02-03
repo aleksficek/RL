@@ -1,6 +1,6 @@
 grpo:
   max_num_epochs: 50
-  num_prompts_per_step: 2
+  num_prompts_per_step: 1
   num_generations_per_prompt: 32
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
   max_num_steps: 1000000
@@ -39,7 +39,7 @@ loss_fn:
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
   truncated_importance_sampling_ratio: null
-  use_importance_sampling_correction: false
+  use_importance_sampling_correction: true
   token_level_loss: true
 
 checkpointing:
@@ -51,13 +51,13 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "Qwen/Qwen3-4B"
+  model_name: "openai/gpt-oss-20b"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     # Qwen3 uses a runtime flag; don't patch tokenizer_config.json.
     # This is also respected by the NeMo-Gym Responses API config below.
     chat_template_kwargs:
-      enable_thinking: false
+      enable_thinking: true
   hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
@@ -67,13 +67,30 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
+  # megatron_cfg:
+  #   enabled: true
+  #   tensor_model_parallel_size: 4
+  #   pipeline_model_parallel_size: 1
+  #   expert_model_parallel_size: 2  # EP=2, TP=4 utilizes all 8 GPUs (2*4=8)
+  #   expert_tensor_parallel_size: 1
+    
+  #   # MoE Specifics
+  #   moe_router_load_balancing_type: "sinkhorn" # Better for GPT-OSS stability
+  #   moe_permute_fusion: true
+    
+  #   # Architecture specifics
+  #   apply_rope_fusion: true
+  #   num_layers: 24
+  #   hidden_size: 2880
+  #   num_attention_heads: 64
+
   dtensor_cfg:
     _v2: false
     enabled: false
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
@@ -81,20 +98,20 @@ policy:
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 4
     # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 0
     activation_checkpointing: true
     # train_iters needs to be large enough to cover all training steps
     train_iters: 100000
-    expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
+    # expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
+    sequence_parallel: true
     freeze_moe_router: true
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
@@ -102,7 +119,7 @@ policy:
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: false
-    moe_permute_fusion: false
+    moe_permute_fusion: true
 
     optimizer:
       optimizer: "adam"
@@ -191,18 +208,19 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
-      tensor_parallel_size: 1
+      tensor_parallel_size: 2
       pipeline_parallel_size: 1
       enable_expert_parallel: false
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.7
       max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: false
+      enforce_eager: True
+      enable_chunked_prefill: true
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       kv_cache_dtype: "auto"
-      expose_http_server: true
+      expose_http_server: false
       skip_tokenizer_init: false
       # Nemotron-specific plugin removed
       tool_parser_plugin: null

@@ -1,6 +1,6 @@
 grpo:
   max_num_epochs: 50
-  num_prompts_per_step: 2
+  num_prompts_per_step: 1
   num_generations_per_prompt: 32
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
   max_num_steps: 1000000
@@ -51,7 +51,7 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "Qwen/Qwen3-4B"
+  model_name: "Qwen/Qwen3-14B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     # Qwen3 uses a runtime flag; don't patch tokenizer_config.json.
@@ -73,7 +73,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
@@ -81,7 +81,7 @@ policy:
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 4
     # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 0
     activation_checkpointing: true

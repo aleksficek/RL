@@ -1,7 +1,7 @@
 grpo:
-  max_num_epochs: 1
-  num_prompts_per_step: 1
-  num_generations_per_prompt: 128
+  max_num_epochs: 30
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 32
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
   max_num_steps: 1000000
   normalize_rewards: true
