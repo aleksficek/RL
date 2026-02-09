@@ -25,8 +25,9 @@ src_dir = Path("Gym")
 
 
 CACHED_DEPENDENCIES = [
-    "openai<=2.6.1",
+    "openai>=2.6.1",
     "tqdm",
+    "orjson",
     "pydantic",
     "pydantic_core",
     "devtools",
@@ -37,7 +38,6 @@ CACHED_DEPENDENCIES = [
     "omegaconf",
     "gradio",
     "mlflow",
-    "tdigest>=0.5.2.2",
     "aiohttp",
     "yappi",
     "ray[default]",
