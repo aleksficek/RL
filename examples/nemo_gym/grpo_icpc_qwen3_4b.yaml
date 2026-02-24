@@ -214,6 +214,8 @@ policy:
         # override on CLI with:
         #   ++policy.generation.vllm_cfg.tool_call_parser=hermes
         tool_parser: hermes
+        # Disable reasoning parsing in vLLM - NeMo Gym handles this
+        # enable_prompt_parsing_for_reasoning: false
     vllm_kwargs:
       compilation_config:
         # when enforce_eager is False, set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
