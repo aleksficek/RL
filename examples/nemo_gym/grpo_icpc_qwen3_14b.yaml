@@ -1,7 +1,7 @@
 grpo:
   max_num_epochs: 50
   num_prompts_per_step: 4
-  num_generations_per_prompt: 32
+  num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
   max_num_steps: 1000000
   normalize_rewards: true
@@ -44,7 +44,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  metric_name: "val:accuracy"
+  metric_name: "train:total_reward:mean"
   higher_is_better: true
   keep_top_k: 20
   save_period: 5  # Save checkpoint every 6 steps (aligned with val_period)
