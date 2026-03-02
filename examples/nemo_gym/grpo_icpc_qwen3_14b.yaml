@@ -44,7 +44,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  metric_name: "train:total_reward:mean"
+  metric_name: "total_reward:mean"
   higher_is_better: true
   keep_top_k: 20
   save_period: 5  # Save checkpoint every 6 steps (aligned with val_period)
