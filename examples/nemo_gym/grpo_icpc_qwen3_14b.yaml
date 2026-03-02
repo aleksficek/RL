@@ -1,7 +1,7 @@
 grpo:
   max_num_epochs: 50
-  num_prompts_per_step: 2
-  num_generations_per_prompt: 16
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 32
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
   max_num_steps: 1000000
   normalize_rewards: true
@@ -46,8 +46,8 @@ checkpointing:
   enabled: true
   metric_name: "val:accuracy"
   higher_is_better: true
-  keep_top_k: 3
-  save_period: 6  # Save checkpoint every 6 steps (aligned with val_period)
+  keep_top_k: 20
+  save_period: 5  # Save checkpoint every 6 steps (aligned with val_period)
   checkpoint_must_save_by: null
 
 policy:
@@ -61,7 +61,7 @@ policy:
       enable_thinking: false
   hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
-  train_micro_batch_size: 1
+  train_micro_batch_size: 4
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
   max_total_sequence_length: 8192
@@ -160,7 +160,7 @@ policy:
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: false
+    enabled: true
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
@@ -196,7 +196,7 @@ policy:
       pipeline_parallel_size: 1
       enable_expert_parallel: false
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.65
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: false
       use_deep_gemm: False
