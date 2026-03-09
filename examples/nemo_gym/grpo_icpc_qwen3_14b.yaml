@@ -248,13 +248,29 @@ data:
 icpc_distillation:
   enabled: false
   weight: 0.2
+  reward_mode: reward_shaping  # reward_shaping | token_weighted_grpo
   teacher_mode: same_model
   teacher_model: null
+  teacher_reference_field: ground_truth_solution
+  teacher_bias_template: |
+    Problem:
+    {problem}
+
+    Here is a reference solution:
+    {reference}
+
+    After understanding the reference solution, please try to solve this problem
+    using your own approach below:
+    Answer:
   top_logprobs: 20
   max_tokens: 256
   compare_max_positions: 256
   temperature: 0.0
   top_p: 1.0
+  token_weight_scale: 0.5
+  token_weight_min: 0.25
+  token_weight_max: 1.75
+  reward_temperature: 10.0
 
 env:
   should_use_nemo_gym: true
@@ -276,14 +292,21 @@ env:
           sandbox_port: 6000
           distillation_enabled: ${icpc_distillation.enabled}
           distillation_weight: ${icpc_distillation.weight}
+          distillation_reward_mode: ${icpc_distillation.reward_mode}
           distillation_teacher_mode: ${icpc_distillation.teacher_mode}
           distillation_teacher_base_url: null
           distillation_teacher_model: ${icpc_distillation.teacher_model}
+          distillation_teacher_reference_field: ${icpc_distillation.teacher_reference_field}
+          distillation_teacher_bias_template: ${icpc_distillation.teacher_bias_template}
           distillation_top_logprobs: ${icpc_distillation.top_logprobs}
           distillation_max_tokens: ${icpc_distillation.max_tokens}
           distillation_compare_max_positions: ${icpc_distillation.compare_max_positions}
           distillation_temperature: ${icpc_distillation.temperature}
           distillation_top_p: ${icpc_distillation.top_p}
+          distillation_token_weight_scale: ${icpc_distillation.token_weight_scale}
+          distillation_token_weight_min: ${icpc_distillation.token_weight_min}
+          distillation_token_weight_max: ${icpc_distillation.token_weight_max}
+          distillation_reward_temperature: ${icpc_distillation.reward_temperature}
     policy_model:
       responses_api_models:
         vllm_model:

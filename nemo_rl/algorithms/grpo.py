@@ -1299,9 +1299,38 @@ def grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-                            message["advantages"] = advantages[i].expand(
+                            per_token_advantages = advantages[i].expand(
                                 message["token_ids"].shape
                             )
+                            if message["role"] == "assistant":
+                                token_weights = message.get("distillation_token_weights")
+                                if isinstance(token_weights, list):
+                                    token_weights = torch.tensor(
+                                        token_weights, dtype=per_token_advantages.dtype
+                                    )
+                                if isinstance(token_weights, torch.Tensor):
+                                    token_weights = token_weights.to(
+                                        device=per_token_advantages.device,
+                                        dtype=per_token_advantages.dtype,
+                                    ).flatten()
+                                    expected_num_tokens = int(message["token_ids"].numel())
+                                    if token_weights.numel() < expected_num_tokens:
+                                        token_weights = torch.cat(
+                                            (
+                                                token_weights,
+                                                torch.ones(
+                                                    expected_num_tokens - token_weights.numel(),
+                                                    device=per_token_advantages.device,
+                                                    dtype=per_token_advantages.dtype,
+                                                ),
+                                            )
+                                        )
+                                    elif token_weights.numel() > expected_num_tokens:
+                                        token_weights = token_weights[:expected_num_tokens]
+                                    per_token_advantages = per_token_advantages * token_weights.view_as(
+                                        per_token_advantages
+                                    )
+                            message["advantages"] = per_token_advantages
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -2246,9 +2275,38 @@ def async_grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-                            message["advantages"] = advantages[i].expand(
+                            per_token_advantages = advantages[i].expand(
                                 message["token_ids"].shape
                             )
+                            if message["role"] == "assistant":
+                                token_weights = message.get("distillation_token_weights")
+                                if isinstance(token_weights, list):
+                                    token_weights = torch.tensor(
+                                        token_weights, dtype=per_token_advantages.dtype
+                                    )
+                                if isinstance(token_weights, torch.Tensor):
+                                    token_weights = token_weights.to(
+                                        device=per_token_advantages.device,
+                                        dtype=per_token_advantages.dtype,
+                                    ).flatten()
+                                    expected_num_tokens = int(message["token_ids"].numel())
+                                    if token_weights.numel() < expected_num_tokens:
+                                        token_weights = torch.cat(
+                                            (
+                                                token_weights,
+                                                torch.ones(
+                                                    expected_num_tokens - token_weights.numel(),
+                                                    device=per_token_advantages.device,
+                                                    dtype=per_token_advantages.dtype,
+                                                ),
+                                            )
+                                        )
+                                    elif token_weights.numel() > expected_num_tokens:
+                                        token_weights = token_weights[:expected_num_tokens]
+                                    per_token_advantages = per_token_advantages * token_weights.view_as(
+                                        per_token_advantages
+                                    )
+                            message["advantages"] = per_token_advantages
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(

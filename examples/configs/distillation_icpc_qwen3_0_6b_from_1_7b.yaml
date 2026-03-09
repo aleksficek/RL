@@ -1,0 +1,81 @@
+defaults: distillation_math.yaml
+
+distillation:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  val_period: 0
+  val_at_start: false
+  max_val_samples: 0
+  topk_logits_k: 64
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: ${..model_name}
+  train_global_batch_size: 64
+  generation_batch_size: 64
+  logprob_batch_size: 2
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: false
+  generation:
+    backend: vllm
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+
+teacher:
+  model_name: Qwen/Qwen3-1.7B
+  tokenizer:
+    name: ${..model_name}
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: false
+
+data:
+  dataset_name: icpc_easy_medium_train_with_solutions
+  train_data_path: /home/aficek/software/storage/data/icpc/icpc_easy_medium_train_with_solutions.jsonl
+  prompt_key: responses_create_params.input
+  reference_key: ground_truth_solution
+  teacher_bias_template: |
+    Problem:
+    {problem}
+
+    Here is a reference solution:
+    {reference}
+
+    After understanding the reference solution, please try to solve this problem
+    using your own approach below:
+    Answer:
+  shuffle: true
+
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-icpc-qwen3-0_6b-from-1_7b
+
+logger:
+  log_dir: logs/distillation-icpc-qwen3-0_6b-from-1_7b
+  num_val_samples_to_print: 0
+  wandb:
+    project: nemo-rl-distill
+    name: distillation-icpc-qwen3-0_6b-from-1_7b
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

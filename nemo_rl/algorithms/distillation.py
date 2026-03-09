@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import warnings
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -496,6 +497,135 @@ def setup(
 # ===============================================================================
 
 
+def _apply_assistant_loss_mask(message_logs: list[Any]) -> None:
+    for message_log in message_logs:
+        for message in message_log:
+            token_ids = message.get("token_ids")
+            if not isinstance(token_ids, torch.Tensor):
+                continue
+            if message.get("role") == "assistant":
+                message["token_loss_mask"] = torch.ones_like(token_ids)
+            else:
+                message["token_loss_mask"] = torch.zeros_like(token_ids)
+
+
+def _trim_teacher_prompt_prefix(
+    teacher_message_log: list[dict[str, Any]],
+    max_total_sequence_length: int,
+) -> None:
+    total_tokens = sum(
+        int(message["token_ids"].numel())
+        for message in teacher_message_log
+        if isinstance(message.get("token_ids"), torch.Tensor)
+    )
+    overflow = total_tokens - max_total_sequence_length
+    if overflow <= 0:
+        return
+
+    for message in teacher_message_log:
+        if overflow <= 0 or message.get("role") == "assistant":
+            break
+        token_ids = message.get("token_ids")
+        if not isinstance(token_ids, torch.Tensor):
+            continue
+        trim = min(overflow, int(token_ids.numel()))
+        if trim <= 0:
+            continue
+        message["token_ids"] = token_ids[trim:]
+        token_loss_mask = message.get("token_loss_mask")
+        if isinstance(token_loss_mask, torch.Tensor):
+            message["token_loss_mask"] = token_loss_mask[trim:]
+        overflow -= trim
+
+
+def _build_teacher_rollout_message_logs(
+    student_message_logs: list[Any],
+    teacher_prompt_message_logs: list[Any],
+    teacher_replace_message_counts: Optional[list[Any]],
+    max_total_sequence_length: int,
+) -> list[Any]:
+    teacher_message_logs = []
+
+    for sample_idx, student_message_log in enumerate(student_message_logs):
+        teacher_prompt_message_log = (
+            teacher_prompt_message_logs[sample_idx]
+            if sample_idx < len(teacher_prompt_message_logs)
+            else None
+        )
+        if not teacher_prompt_message_log:
+            teacher_message_logs.append(deepcopy(student_message_log))
+            continue
+
+        replace_count = 0
+        if (
+            teacher_replace_message_counts is not None
+            and sample_idx < len(teacher_replace_message_counts)
+        ):
+            try:
+                replace_count = int(teacher_replace_message_counts[sample_idx])
+            except (TypeError, ValueError):
+                replace_count = 0
+        replace_count = max(0, min(replace_count, len(student_message_log)))
+
+        teacher_message_log = deepcopy(teacher_prompt_message_log) + deepcopy(
+            student_message_log[replace_count:]
+        )
+        _apply_assistant_loss_mask([teacher_message_log])
+        _trim_teacher_prompt_prefix(
+            teacher_message_log,
+            max_total_sequence_length=max_total_sequence_length,
+        )
+        teacher_message_logs.append(teacher_message_log)
+
+    return teacher_message_logs
+
+
+def _align_teacher_topk_to_student_masks(
+    *,
+    student_token_mask: torch.Tensor,
+    teacher_token_mask: torch.Tensor,
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    batch_size = int(student_token_mask.shape[0])
+    student_seq_len = int(student_token_mask.shape[1] - 1)
+    topk = int(teacher_topk_indices.shape[-1])
+
+    aligned_logits = torch.zeros(
+        (batch_size, student_seq_len, topk),
+        dtype=teacher_topk_logits.dtype,
+    )
+    aligned_indices = torch.zeros(
+        (batch_size, student_seq_len, topk),
+        dtype=teacher_topk_indices.dtype,
+    )
+    invalid_samples: list[int] = []
+
+    student_assistant_mask = student_token_mask[:, 1:].bool()
+    teacher_assistant_mask = teacher_token_mask[:, 1:].bool()
+
+    for sample_idx in range(batch_size):
+        student_positions = student_assistant_mask[sample_idx]
+        teacher_positions = teacher_assistant_mask[sample_idx]
+
+        student_count = int(student_positions.sum().item())
+        teacher_count = int(teacher_positions.sum().item())
+        if student_count == 0:
+            continue
+        if teacher_count != student_count:
+            invalid_samples.append(sample_idx)
+            continue
+
+        aligned_logits[sample_idx, student_positions] = teacher_topk_logits[
+            sample_idx, teacher_positions
+        ]
+        aligned_indices[sample_idx, student_positions] = teacher_topk_indices[
+            sample_idx, teacher_positions
+        ]
+
+    return aligned_logits, aligned_indices, invalid_samples
+
+
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -653,16 +783,7 @@ def distillation_train(
 
                 with timer.time("data_processing"):
                     # Add loss mask and advantages to each message in LLMMessageLogType
-                    for message_log in repeated_batch["message_log"]:
-                        for message in message_log:
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
+                    _apply_assistant_loss_mask(repeated_batch["message_log"])
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -694,11 +815,74 @@ def distillation_train(
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data, k=master_config["distillation"]["topk_logits_k"]
+                    teacher_prompt_message_logs = repeated_batch.get("teacher_message_log")
+                    use_teacher_conditioned_prompts = bool(teacher_prompt_message_logs) and any(
+                        teacher_prompt_message_log is not None
+                        for teacher_prompt_message_log in teacher_prompt_message_logs
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+
+                    if use_teacher_conditioned_prompts:
+                        teacher_message_logs = _build_teacher_rollout_message_logs(
+                            student_message_logs=repeated_batch["message_log"],
+                            teacher_prompt_message_logs=teacher_prompt_message_logs,
+                            teacher_replace_message_counts=repeated_batch.get(
+                                "teacher_replace_message_count"
+                            ),
+                            max_total_sequence_length=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
+                        )
+                        (
+                            teacher_flat_messages,
+                            teacher_input_lengths,
+                        ) = batched_message_log_to_flat_message(
+                            teacher_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=master_config["policy"][
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                        teacher_data = BatchedDataDict[DistillationLossDataDict](
+                            {
+                                "input_ids": teacher_flat_messages["token_ids"],
+                                "input_lengths": teacher_input_lengths,
+                            }
+                        )
+                        teacher_data.update(
+                            teacher_flat_messages.get_multimodal_dict(as_tensors=False)
+                        )
+                        teacher_data.to("cpu")
+
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            teacher_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                        )
+                        (
+                            aligned_teacher_topk_logits,
+                            aligned_teacher_topk_indices,
+                            invalid_samples,
+                        ) = _align_teacher_topk_to_student_masks(
+                            student_token_mask=flat_messages["token_loss_mask"],
+                            teacher_token_mask=teacher_flat_messages["token_loss_mask"],
+                            teacher_topk_logits=teacher_topk["topk_logits"],
+                            teacher_topk_indices=teacher_topk["topk_indices"],
+                        )
+                        train_data["teacher_topk_logits"] = aligned_teacher_topk_logits
+                        train_data["teacher_topk_indices"] = aligned_teacher_topk_indices
+                        if invalid_samples:
+                            train_data["sample_mask"][invalid_samples] = 0
+                            print(
+                                "  ⚠️ Skipping "
+                                f"{len(invalid_samples)} reference-conditioned samples "
+                                "because teacher and student assistant token counts diverged.",
+                                flush=True,
+                            )
+                    else:
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            train_data, k=master_config["distillation"]["topk_logits_k"]
+                        )
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):

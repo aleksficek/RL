@@ -59,6 +59,30 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         extra_args["vllm_images"] = vllm_images
         extra_args["vllm_videos"] = vllm_videos
 
+    preserved_extra_fields = {}
+    reserved_keys = {
+        "message_log",
+        "length",
+        "loss_multiplier",
+        "extra_env_info",
+        "task_name",
+        "idx",
+        "stop_strings",
+        "vllm_content",
+        "vllm_images",
+        "vllm_videos",
+    }
+    extra_field_names = sorted(
+        {
+            key
+            for datum_spec in data_batch
+            for key in datum_spec.keys()
+            if key not in reserved_keys
+        }
+    )
+    for key in extra_field_names:
+        preserved_extra_fields[key] = [datum_spec.get(key) for datum_spec in data_batch]
+
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         length=length,
@@ -69,6 +93,7 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
         **extra_args,
+        **preserved_extra_fields,
     )
     return output
 

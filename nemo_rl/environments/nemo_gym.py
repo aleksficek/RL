@@ -150,6 +150,19 @@ Depending on your data shape, you may want to change these values."""
     ) -> dict:
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
+        distillation_token_weights: List[float] = []
+        details = nemo_gym_result.get("details")
+        if isinstance(details, dict):
+            distillation = details.get("distillation")
+            if isinstance(distillation, dict):
+                maybe_weights = distillation.get("token_advantage_weights")
+                if isinstance(maybe_weights, list):
+                    for weight in maybe_weights:
+                        try:
+                            distillation_token_weights.append(float(weight))
+                        except Exception:
+                            continue
+        token_weight_idx = 0
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -176,16 +189,25 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     ),
                 }
             )
-            nemo_rl_message_log.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
-                }
-            )
+            assistant_message = {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                "generation_logprobs": torch.tensor(
+                    output_item_dict["generation_log_probs"]
+                ),
+            }
+            gen_num_tokens = int(assistant_message["token_ids"].numel())
+            if distillation_token_weights:
+                message_weights = distillation_token_weights[
+                    token_weight_idx : token_weight_idx + gen_num_tokens
+                ]
+                if message_weights:
+                    assistant_message["distillation_token_weights"] = torch.tensor(
+                        message_weights, dtype=torch.float32
+                    )
+                token_weight_idx += gen_num_tokens
+            nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
