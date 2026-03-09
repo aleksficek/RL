@@ -1,5 +1,9 @@
 defaults: distillation_icpc_qwen3_0_6b_from_1_7b.yaml
 
+distillation:
+  teacher_update_mode: fixed
+  teacher_update_period: 1
+
 policy:
   model_name: Qwen/Qwen3-14B
   tokenizer:

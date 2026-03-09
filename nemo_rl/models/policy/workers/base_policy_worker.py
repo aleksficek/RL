@@ -18,7 +18,10 @@ import torch
 import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.models.policy.interfaces import (
+    ReferenceLogprobOutputSpec,
+    TopkLogitsOutputSpec,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -147,6 +150,27 @@ class AbstractPolicyWorker:
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+        return return_data
+
+    @wrap_with_nvtx_name("policy_worker/get_reference_topk_logits")
+    def get_reference_topk_logits(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get top-k logits from the reference policy for a batch of data."""
+        with self.use_reference_model():
+            reference_topk = self.get_topk_logits(
+                data=data,
+                k=k,
+                micro_batch_size=micro_batch_size,
+            )
+
+        return_data = BatchedDataDict[TopkLogitsOutputSpec]()
+        return_data["topk_logits"] = reference_topk["topk_logits"].cpu()
+        return_data["topk_indices"] = reference_topk["topk_indices"].cpu()
         return return_data
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:

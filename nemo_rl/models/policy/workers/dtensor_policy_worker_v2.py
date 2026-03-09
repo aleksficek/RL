@@ -1752,6 +1752,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
+    @torch.no_grad()
+    def sync_reference_model_from_current_model(self) -> None:
+        """Refresh the CPU reference snapshot from the current training model."""
+        self.reference_model_state_dict = get_cpu_state_dict(
+            self.model.state_dict().items(),
+            pin_memory=True,
+        )
+
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
         noise_std = 0.01  # Standard deviation for the noise

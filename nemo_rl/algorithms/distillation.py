@@ -84,6 +84,8 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    teacher_update_mode: NotRequired[str]
+    teacher_update_period: NotRequired[int]
 
 
 class DistillationSaveState(TypedDict):
@@ -153,6 +155,40 @@ def check_vocab_equality(
     )
 
 
+def _get_teacher_update_mode(distillation_config: DistillationConfig) -> str:
+    mode = distillation_config.get("teacher_update_mode", "fixed")
+    if mode not in {"fixed", "periodic_sync"}:
+        raise ValueError(
+            "distillation.teacher_update_mode must be one of "
+            "{'fixed', 'periodic_sync'}."
+        )
+    return mode
+
+
+def _get_teacher_update_period(distillation_config: DistillationConfig) -> int:
+    period = int(distillation_config.get("teacher_update_period", 1))
+    if period < 1:
+        raise ValueError("distillation.teacher_update_period must be >= 1.")
+    return period
+
+
+def _should_use_periodic_reference_teacher(
+    policy_config: PolicyConfig,
+    teacher_config: PolicyConfig,
+    distillation_config: DistillationConfig,
+) -> bool:
+    mode = _get_teacher_update_mode(distillation_config)
+    _get_teacher_update_period(distillation_config)
+    if mode != "periodic_sync":
+        return False
+    if teacher_config["model_name"] != policy_config["model_name"]:
+        raise ValueError(
+            "distillation.teacher_update_mode=periodic_sync is only supported "
+            "when teacher.model_name matches policy.model_name."
+        )
+    return True
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -160,7 +196,7 @@ def setup(
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     ColocatablePolicyInterface,  # student_policy
-    ColocatablePolicyInterface,  # teacher_policy
+    Optional[ColocatablePolicyInterface],  # teacher_policy
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
@@ -186,6 +222,12 @@ def setup(
     data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
+    teacher_update_period = _get_teacher_update_period(distillation_config)
+    use_periodic_reference_teacher = _should_use_periodic_reference_teacher(
+        policy_config,
+        teacher_config,
+        distillation_config,
+    )
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
@@ -365,7 +407,7 @@ def setup(
     # ==========================
     #      Teacher Policy
     # ==========================
-    print("\n▶ Setting up teacher policy...", flush=True)
+    teacher_policy: Optional[ColocatablePolicyInterface] = None
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
@@ -383,17 +425,32 @@ def setup(
         )
         teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    teacher_policy = Policy(
-        name_prefix="teacher",
-        cluster=train_cluster,
-        config=teacher_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=False,
-        init_reference_model=False,
-    )
-    teacher_policy.offload_after_refit()
+    if use_periodic_reference_teacher:
+        print(
+            "\n▶ Using the student reference snapshot as the teacher "
+            f"(sync every {teacher_update_period} step(s))...",
+            flush=True,
+        )
+        if last_checkpoint_path:
+            print(
+                "  ⚠️ Resuming periodic self-distillation does not restore the last "
+                "synced teacher snapshot; it is reinitialized during worker startup "
+                "until the next sync.",
+                flush=True,
+            )
+    else:
+        print("\n▶ Setting up teacher policy...", flush=True)
+        teacher_policy = Policy(
+            name_prefix="teacher",
+            cluster=train_cluster,
+            config=teacher_config,
+            tokenizer=tokenizer,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=False,
+            init_reference_model=False,
+        )
+        teacher_policy.offload_after_refit()
 
     # ==========================
     #    Student Generation Interface
@@ -448,7 +505,7 @@ def setup(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
-        init_reference_model=False,
+        init_reference_model=use_periodic_reference_teacher,
     )
 
     if student_generation is not None:
@@ -628,7 +685,7 @@ def _align_teacher_topk_to_student_masks(
 
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
-    teacher_policy: ColocatablePolicyInterface,
+    teacher_policy: Optional[ColocatablePolicyInterface],
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
@@ -670,12 +727,24 @@ def distillation_train(
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    teacher_update_mode = _get_teacher_update_mode(master_config["distillation"])
+    teacher_update_period = _get_teacher_update_period(master_config["distillation"])
+    use_reference_teacher = teacher_update_mode == "periodic_sync"
     max_epochs = master_config["distillation"][
         "max_num_epochs"
     ]  # max number of epochs to train for
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    if use_reference_teacher and teacher_policy is not None:
+        raise ValueError(
+            "teacher_update_mode=periodic_sync expects the teacher to run from the "
+            "student reference snapshot."
+        )
+    if not use_reference_teacher and teacher_policy is None:
+        raise ValueError("A teacher policy is required when teacher_update_mode=fixed.")
+
+    student_policy_with_reference = cast(Any, student_policy)
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -811,7 +880,10 @@ def distillation_train(
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
-                    teacher_policy.prepare_for_lp_inference()
+                    if use_reference_teacher:
+                        student_policy.prepare_for_lp_inference()
+                    else:
+                        teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
@@ -853,10 +925,18 @@ def distillation_train(
                         )
                         teacher_data.to("cpu")
 
-                        teacher_topk = teacher_policy.get_topk_logits(
-                            teacher_data,
-                            k=master_config["distillation"]["topk_logits_k"],
-                        )
+                        if use_reference_teacher:
+                            teacher_topk = (
+                                student_policy_with_reference.get_reference_topk_logits(
+                                    teacher_data,
+                                    k=master_config["distillation"]["topk_logits_k"],
+                                )
+                            )
+                        else:
+                            teacher_topk = teacher_policy.get_topk_logits(
+                                teacher_data,
+                                k=master_config["distillation"]["topk_logits_k"],
+                            )
                         (
                             aligned_teacher_topk_logits,
                             aligned_teacher_topk_indices,
@@ -878,21 +958,44 @@ def distillation_train(
                                 flush=True,
                             )
                     else:
-                        teacher_topk = teacher_policy.get_topk_logits(
-                            train_data, k=master_config["distillation"]["topk_logits_k"]
-                        )
+                        if use_reference_teacher:
+                            teacher_topk = (
+                                student_policy_with_reference.get_reference_topk_logits(
+                                    train_data,
+                                    k=master_config["distillation"]["topk_logits_k"],
+                                )
+                            )
+                        else:
+                            teacher_topk = teacher_policy.get_topk_logits(
+                                train_data,
+                                k=master_config["distillation"]["topk_logits_k"],
+                            )
                         train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
+                    if teacher_policy is not None:
+                        teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     train_results = student_policy.train(train_data, loss_fn)
+                teacher_sync_performed = 0.0
+                if (
+                    use_reference_teacher
+                    and (total_steps + 1) % teacher_update_period == 0
+                ):
+                    with timer.time("teacher_sync"):
+                        student_policy_with_reference.sync_reference_model_from_current_model()
+                    teacher_sync_performed = 1.0
+                    print(
+                        "▶ Synced reference teacher from student weights "
+                        f"at step {total_steps + 1}.",
+                        flush=True,
+                    )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -943,6 +1046,7 @@ def distillation_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                metrics["teacher_sync_performed"] = teacher_sync_performed
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing

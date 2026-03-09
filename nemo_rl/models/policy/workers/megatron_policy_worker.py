@@ -1528,6 +1528,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 if self.should_disable_forward_pre_hook:
                     self.enable_forward_pre_hook()
 
+    @torch.no_grad()
+    def sync_reference_model_from_current_model(self) -> None:
+        """Refresh the CPU reference snapshot from the current training model."""
+        self.reference_state_dict = {}
+        for name, item in self.model.state_dict().items():
+            if isinstance(item, torch.Tensor):
+                cpu_item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+            else:
+                cpu_item = item
+            self.reference_state_dict[name] = cpu_item
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
     def get_topk_logits(
         self,

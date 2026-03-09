@@ -405,6 +405,35 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        return self._dispatch_topk_logits(
+            method_name="get_topk_logits",
+            data=data,
+            k=k,
+            micro_batch_size=micro_batch_size,
+        )
+
+    def get_reference_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Dispatch reference top-k inference to workers."""
+        return self._dispatch_topk_logits(
+            method_name="get_reference_topk_logits",
+            data=data,
+            k=k,
+            micro_batch_size=micro_batch_size,
+        )
+
+    def _dispatch_topk_logits(
+        self,
+        method_name: str,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Dispatch top-k inference to workers and preserve [B, S, k] tensors."""
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
@@ -434,7 +463,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         futures = self.worker_group.run_all_workers_sharded_data(
-            "get_topk_logits",
+            method_name,
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
@@ -463,6 +492,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             stacked.reorder_data(unsorted_data_indices)
 
         return stacked
+
+    def sync_reference_model_from_current_model(self) -> None:
+        """Refresh the worker-side reference snapshot from the current training model."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "sync_reference_model_from_current_model"
+        )
+        ray.get(futures)
 
     def train(
         self,
