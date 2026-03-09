@@ -645,7 +645,7 @@ def _align_teacher_topk_to_student_masks(
     teacher_topk_indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     batch_size = int(student_token_mask.shape[0])
-    student_seq_len = int(student_token_mask.shape[1] - 1)
+    student_seq_len = int(student_token_mask.shape[1])
     topk = int(teacher_topk_indices.shape[-1])
 
     aligned_logits = torch.zeros(
@@ -676,23 +676,27 @@ def _align_teacher_topk_to_student_masks(
         )
 
     for sample_idx in range(batch_size):
-        student_positions = student_assistant_mask[sample_idx]
-        teacher_positions = teacher_assistant_mask[sample_idx]
+        student_positions = student_assistant_mask[sample_idx].nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        teacher_positions = teacher_assistant_mask[sample_idx].nonzero(
+            as_tuple=False
+        ).squeeze(-1)
 
-        student_count = int(student_positions.sum().item())
-        teacher_count = int(teacher_positions.sum().item())
+        student_count = int(student_positions.numel())
+        teacher_count = int(teacher_positions.numel())
         if student_count == 0:
             continue
         if teacher_count != student_count:
             invalid_samples.append(sample_idx)
             continue
 
-        aligned_logits[sample_idx, student_positions] = teacher_logits_for_targets[
+        aligned_logits[sample_idx, student_positions + 1] = teacher_logits_for_targets[
             sample_idx, teacher_positions
         ]
-        aligned_indices[sample_idx, student_positions] = teacher_indices_for_targets[
-            sample_idx, teacher_positions
-        ]
+        aligned_indices[sample_idx, student_positions + 1] = (
+            teacher_indices_for_targets[sample_idx, teacher_positions]
+        )
 
     return aligned_logits, aligned_indices, invalid_samples
 
