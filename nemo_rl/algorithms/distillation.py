@@ -660,6 +660,20 @@ def _align_teacher_topk_to_student_masks(
 
     student_assistant_mask = student_token_mask[:, 1:].bool()
     teacher_assistant_mask = teacher_token_mask[:, 1:].bool()
+    teacher_target_seq_len = int(teacher_assistant_mask.shape[1])
+
+    teacher_logits_for_targets = teacher_topk_logits
+    teacher_indices_for_targets = teacher_topk_indices
+    teacher_topk_seq_len = int(teacher_topk_logits.shape[1])
+    if teacher_topk_seq_len == teacher_target_seq_len + 1:
+        teacher_logits_for_targets = teacher_topk_logits[:, :-1, :]
+        teacher_indices_for_targets = teacher_topk_indices[:, :-1, :]
+    elif teacher_topk_seq_len != teacher_target_seq_len:
+        raise ValueError(
+            "Teacher top-k sequence length does not match the teacher token mask. "
+            f"Got top-k seq len {teacher_topk_seq_len} and teacher target mask len "
+            f"{teacher_target_seq_len}."
+        )
 
     for sample_idx in range(batch_size):
         student_positions = student_assistant_mask[sample_idx]
@@ -673,10 +687,10 @@ def _align_teacher_topk_to_student_masks(
             invalid_samples.append(sample_idx)
             continue
 
-        aligned_logits[sample_idx, student_positions] = teacher_topk_logits[
+        aligned_logits[sample_idx, student_positions] = teacher_logits_for_targets[
             sample_idx, teacher_positions
         ]
-        aligned_indices[sample_idx, student_positions] = teacher_topk_indices[
+        aligned_indices[sample_idx, student_positions] = teacher_indices_for_targets[
             sample_idx, teacher_positions
         ]
 
