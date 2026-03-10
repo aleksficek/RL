@@ -196,14 +196,17 @@ def setup_data(
     raw_ds = load_dataset("json", data_files=train_path)["train"]
 
     def _process_row(row: dict[str, Any]) -> dict[str, Any]:
+        teacher_reference = _extract_nested(row, reference_key)
+        if isinstance(teacher_reference, str):
+            teacher_reference = teacher_reference.strip()
+        else:
+            teacher_reference = ""
         processed = {
             "prompt": _extract_nested(row, prompt_key),
             "task_name": task_name,
+            "teacher_reference": teacher_reference,
+            "teacher_bias_template": teacher_bias_template,
         }
-        teacher_reference = _extract_nested(row, reference_key)
-        if isinstance(teacher_reference, str) and teacher_reference.strip():
-            processed["teacher_reference"] = teacher_reference.strip()
-            processed["teacher_bias_template"] = teacher_bias_template
         return processed
 
     ds = raw_ds.map(_process_row)
