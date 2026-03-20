@@ -51,20 +51,15 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  # model_name: "openai/gpt-oss-20b"
   model_name: "/lustre/fsw/portfolios/llmservice/users/igitman/hf_models/gpt-oss-20b"
   tokenizer:
-    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-    # Qwen3 uses a runtime flag; don't patch tokenizer_config.json.
-    # This is also respected by the NeMo-Gym Responses API config below.
-    chat_template_kwargs:
-      enable_thinking: false
+    name: ${policy.model_name}
   hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  generation_batch_size: 32 # Only used when generating using HF backend
-  max_total_sequence_length: 4096
+  generation_batch_size: 16 # Only used when generating using HF backend
+  max_total_sequence_length: 2048
   precision: "bfloat16"
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
@@ -89,7 +84,7 @@ policy:
     _v2: false
     enabled: false
     cpu_offload: False
-    sequence_parallel: false
+    sequence_parallel: True
     activation_checkpointing: true
     tensor_parallel_size: 4
     context_parallel_size: 1
@@ -99,28 +94,29 @@ policy:
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false
-    tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 8
     # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 2
     activation_checkpointing: true
     # train_iters needs to be large enough to cover all training steps
     train_iters: 100000
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 8
+    expert_model_parallel_size: 4  # TP=4 * EP=4 = 16 GPUs for 2-nodes
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
+    moe_per_layer_logging: false
     freeze_moe_router: true
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: false
-    moe_permute_fusion: true
+    defer_fp32_logits: True
+    moe_permute_fusion: True
 
     optimizer:
       optimizer: "adam"
@@ -144,8 +140,8 @@ policy:
       use_precision_aware_optimizer: true
 
       # optimizer cpu offload
-      optimizer_cpu_offload: false
-      optimizer_offload_fraction: 0.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
 
       clip_grad: ${policy.max_grad_norm}
 
@@ -162,11 +158,16 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
-      overlap_param_gather: true
+      overlap_param_gather: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    env_vars: null
+    env_vars:
+      # Disable NCCL's CuMem-based multicast/symmetric memory allocation.
+      # Without this, NCCL allocates ~57 GiB of NVLink virtual memory per GPU
+      # during communicator init, leaving no room for model weights.
+      NCCL_NVLS_ENABLE: "0"
+      NCCL_CUMEM_ENABLE: "0"
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
@@ -185,9 +186,9 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: 1
+  make_sequence_length_divisible_by: 8  # must match tensor_model_parallel_size for sequence_parallel
   max_grad_norm: 1.0
-  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  offload_optimizer_for_logprob: true # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 
   optimizer: null
 
@@ -209,19 +210,21 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
-      tensor_parallel_size: 2
+      tensor_parallel_size: 8
       pipeline_parallel_size: 1
       enable_expert_parallel: false
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.2
       max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: True
-      enable_chunked_prefill: true
+      # enforce_eager: false enables CuMemAllocator sleep/wake for ALL TP ranks.
+      # With enforce_eager: True, only rank-0 workers free memory during sleep,
+      # leaving ~60 GiB stuck on other GPUs and causing Megatron OOM.
+      enforce_eager: false
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       kv_cache_dtype: "auto"
-      expose_http_server: false
+      expose_http_server: true
       skip_tokenizer_init: false
       # Nemotron-specific plugin removed
       tool_parser_plugin: null
@@ -229,6 +232,7 @@ policy:
         # Workplace assistant uses 26 tools, so we enable auto_tools.
         # DISABLED due to vLLM version incompatibility with token_ids parameter
         enable_auto_tools: false
+
         # Switch from nemotron_json to a Qwen-friendly tool parser (vLLM built-in).
         # If your vLLM build expects `tool_call_parser` instead of `tool_parser`,
         # override on CLI with:
@@ -238,10 +242,12 @@ policy:
         # enable_prompt_parsing_for_reasoning: false
     vllm_kwargs:
       compilation_config:
-        # when enforce_eager is False, set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
-        # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
-        # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
         use_inductor: False
+        # level=0: disables torch.compile + CUDA graph capture.
+        # gpt-oss-20b's RoPE mutates cos_sin_cache buffer during forward,
+        # which torch._dynamo rejects when compiling with cudagraphs.
+        # enforce_eager=false (above) is still needed for CuMemAllocator sleep.
+        level: 0
       # Nemotron/Mamba-specific setting removed
       # mamba_ssm_cache_dtype: null
     colocated:
@@ -280,29 +286,26 @@ env:
     policy_model:
       responses_api_models:
         vllm_model:
-          # Disable reasoning!
-          uses_reasoning_parser: false
-          chat_template_kwargs:
-            enable_thinking: false
+          uses_reasoning_parser: true
 
 logger:
-  log_dir: "logs/grpo-workplace-assistant-qwen3-4b"  # Base directory for all logs
-  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  log_dir: "logs/grpo-icpc-gpt-oss-20b"
+  num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: false
-  mlflow_enabled: false  # Disable MLflow logging
+  mlflow_enabled: false
   swanlab_enabled: false
-  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  monitor_gpus: true
   wandb:
-    project: "grpo-workplace-assistant"
-    name: "qwen3-4b-workplace-assistant"
+    project: "nemo-rl-training"
+    name: "gpt-oss-20b-icpc"
   tensorboard: {}
   mlflow:
-    experiment_name: "grpo-workplace-assistant"
-    run_name: "qwen3-4b-workplace-assistant"
+    experiment_name: "grpo-icpc"
+    run_name: "gpt-oss-20b-icpc"
   gpu_monitoring:
-    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
-    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+    collection_interval: 10
+    flush_interval: 10
 
 cluster:
   gpus_per_node: 8

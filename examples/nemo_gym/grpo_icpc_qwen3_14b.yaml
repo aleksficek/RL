@@ -1,12 +1,12 @@
 grpo:
   max_num_epochs: 50
-  num_prompts_per_step: 4
-  num_generations_per_prompt: 16
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 64
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 10
+  val_period: 5
   val_at_start: false
   overlong_filtering: false
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
@@ -44,9 +44,9 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  metric_name: "total_reward:mean"
+  metric_name: "val:accuracy"
   higher_is_better: true
-  keep_top_k: 20
+  keep_top_k: 1
   save_period: 5  # Save checkpoint every 6 steps (aligned with val_period)
   checkpoint_must_save_by: null
 
@@ -61,10 +61,10 @@ policy:
       enable_thinking: false
   hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
-  train_micro_batch_size: 4
+  train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 32768
   precision: "bfloat16"
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
