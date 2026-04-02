@@ -1,5 +1,5 @@
 grpo:
-  max_num_epochs: 50
+  max_num_epochs: 5
   num_prompts_per_step: 1
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
@@ -46,14 +46,18 @@ checkpointing:
   enabled: true
   metric_name: "val:accuracy"
   higher_is_better: true
-  keep_top_k: 3
-  save_period: 6  # Save checkpoint every 6 steps (aligned with val_period)
+  keep_top_k: 20
+  save_period: 10  # Save checkpoint every 10 steps (aligned with val_period)
   checkpoint_must_save_by: null
 
 policy:
   model_name: "/lustre/fsw/portfolios/llmservice/users/igitman/hf_models/gpt-oss-20b"
   tokenizer:
-    name: ${policy.model_name}
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    # Qwen3 uses a runtime flag; don't patch tokenizer_config.json.
+    # This is also respected by the NeMo-Gym Responses API config below.
+    chat_template_kwargs:
+      enable_thinking: false
   hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
@@ -84,7 +88,7 @@ policy:
     _v2: false
     enabled: false
     cpu_offload: False
-    sequence_parallel: True
+    sequence_parallel: False
     activation_checkpointing: true
     tensor_parallel_size: 4
     context_parallel_size: 1
@@ -101,7 +105,7 @@ policy:
     # train_iters needs to be large enough to cover all training steps
     train_iters: 100000
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 4  # TP=4 * EP=4 = 16 GPUs for 2-nodes
+    expert_model_parallel_size: 8  # TP=4 * EP=4 = 16 GPUs for 2-nodes
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
@@ -115,8 +119,8 @@ policy:
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: True
-    moe_permute_fusion: True
+    defer_fp32_logits: false
+    moe_permute_fusion: true
 
     optimizer:
       optimizer: "adam"
@@ -140,8 +144,8 @@ policy:
       use_precision_aware_optimizer: true
 
       # optimizer cpu offload
-      optimizer_cpu_offload: true
-      optimizer_offload_fraction: 1.0
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
 
       clip_grad: ${policy.max_grad_norm}
 
@@ -158,16 +162,11 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
-      overlap_param_gather: false
+      overlap_param_gather: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    env_vars:
-      # Disable NCCL's CuMem-based multicast/symmetric memory allocation.
-      # Without this, NCCL allocates ~57 GiB of NVLink virtual memory per GPU
-      # during communicator init, leaving no room for model weights.
-      NCCL_NVLS_ENABLE: "0"
-      NCCL_CUMEM_ENABLE: "0"
+    env_vars: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
@@ -188,7 +187,7 @@ policy:
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: 8  # must match tensor_model_parallel_size for sequence_parallel
   max_grad_norm: 1.0
-  offload_optimizer_for_logprob: true # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 
   optimizer: null
 
@@ -210,21 +209,22 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
-      tensor_parallel_size: 8
+      tensor_parallel_size: 2
       pipeline_parallel_size: 1
       enable_expert_parallel: false
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.5
       max_model_len: ${policy.max_total_sequence_length}
       # enforce_eager: false enables CuMemAllocator sleep/wake for ALL TP ranks.
       # With enforce_eager: True, only rank-0 workers free memory during sleep,
       # leaving ~60 GiB stuck on other GPUs and causing Megatron OOM.
-      enforce_eager: false
+      enforce_eager: True
+      enable_chunked_prefill: true
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       kv_cache_dtype: "auto"
-      expose_http_server: true
+      expose_http_server: false
       skip_tokenizer_init: false
       # Nemotron-specific plugin removed
       tool_parser_plugin: null
@@ -286,7 +286,10 @@ env:
     policy_model:
       responses_api_models:
         vllm_model:
-          uses_reasoning_parser: true
+          # Disable reasoning!
+          uses_reasoning_parser: false
+          chat_template_kwargs:
+            enable_thinking: false
 
 logger:
   log_dir: "logs/grpo-icpc-gpt-oss-20b"

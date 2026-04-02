@@ -25,24 +25,32 @@ src_dir = Path("Gym")
 
 
 CACHED_DEPENDENCIES = [
-    "openai>=2.6.1",
+    "openai<=2.6.1",
     "tqdm",
     "orjson",
     "pydantic",
     "pydantic_core",
     "devtools",
     "fastapi",
+    "itsdangerous",
     "uvicorn",
     "uvloop",
     "hydra-core",
     "omegaconf",
-    "gradio",
+    "rich",
+    "mlflow-skinny",
     "mlflow",
-    "aiohttp",
+    "aiohttp>=3.13.3",
     "yappi",
     "ray[default]",
     "psutil",
     "datasets",
+    "urllib3>=2.6.3",
+    "fonttools>=4.60.2",
+    "python-multipart>=0.0.22",
+    "wandb",
+    "gprof2dot",
+    "pydot",
 ]
 
 if src_dir.exists():
