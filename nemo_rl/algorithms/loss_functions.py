@@ -967,6 +967,7 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    teacher_temperature: NotRequired[float]  # softens teacher distribution; 1.0 = no change
 
 
 class DistillationLossDataDict(TypedDict):
@@ -985,6 +986,7 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.teacher_temperature = float(cfg.get("teacher_temperature", 1.0))  # type: ignore[attr-defined]
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -992,6 +994,7 @@ class DistillationLossFn(LossFunction):
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        assert self.teacher_temperature > 0, "teacher_temperature must be positive"
 
     def __call__(
         self,
@@ -1143,8 +1146,10 @@ class DistillationLossFn(LossFunction):
         teacher_topk_logits = teacher_topk_logits.to(
             student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
         )
+        # Apply temperature to soften peaked teacher distributions.
+        # teacher_temperature > 1 flattens the distribution; = 1 is no change.
         teacher_topk_logprobs = torch.nn.functional.log_softmax(
-            teacher_topk_logits, dim=-1
+            teacher_topk_logits / self.teacher_temperature, dim=-1
         )
 
         # Single point of next-token alignment after TP/CP processing

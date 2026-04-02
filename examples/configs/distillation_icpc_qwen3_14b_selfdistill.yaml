@@ -21,8 +21,8 @@ policy:
     context_parallel_size: 1
   generation:
     vllm_cfg:
-      tensor_parallel_size: 2
-      gpu_memory_utilization: 0.6
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8
 
 teacher:
   model_name: ${policy.model_name}

@@ -553,6 +553,154 @@ def setup(
 # Training & Validation
 # ===============================================================================
 
+LOG_SAMPLE_PERIOD = 1  # log debug samples every N steps (set to 0 to disable)
+LOG_NUM_SAMPLES = 2    # number of decoded samples to print per debug step
+
+
+def _log_debug_samples(
+    step: int,
+    tokenizer: Any,
+    train_data: Any,
+    repeated_batch: Any,
+    invalid_samples: list[int],
+) -> None:
+    """Print per-step sample diagnostics to stdout.
+
+    Outputs every LOG_SAMPLE_PERIOD steps. Shows:
+      - sample_mask and token_mask statistics
+      - fraction of student tokens found in teacher's top-k
+      - teacher top-1 logit statistics at loss positions
+      - per-sample generation length
+      - decoded prompt + response for LOG_NUM_SAMPLES samples
+    """
+    if LOG_SAMPLE_PERIOD <= 0 or step % LOG_SAMPLE_PERIOD != 0:
+        return
+
+    print(f"\n{'#' * 70}", flush=True)
+    print(f"[SAMPLE DEBUG] Step {step + 1}", flush=True)
+    print(f"{'#' * 70}", flush=True)
+
+    sample_mask = train_data.get("sample_mask")
+    token_mask = train_data.get("token_mask")
+    teacher_topk_indices = train_data.get("teacher_topk_indices")
+    teacher_topk_logits = train_data.get("teacher_topk_logits")
+    input_ids = train_data.get("input_ids")
+
+    # sample_mask stats
+    if sample_mask is not None:
+        valid = int((sample_mask > 0).sum().item())
+        total = int(sample_mask.numel())
+        print(
+            f"[SAMPLE DEBUG] sample_mask: {valid}/{total} valid "
+            f"({100.0 * valid / max(1, total):.1f}%)",
+            flush=True,
+        )
+    if invalid_samples:
+        print(
+            f"[SAMPLE DEBUG] invalid_samples (teacher/student token-count mismatch): "
+            f"{len(invalid_samples)}  indices={invalid_samples[:10]}",
+            flush=True,
+        )
+
+    # token_mask stats
+    if token_mask is not None:
+        valid_toks = int(token_mask.sum().item())
+        total_toks = int(token_mask.numel())
+        print(
+            f"[SAMPLE DEBUG] token_mask: {valid_toks}/{total_toks} loss tokens "
+            f"({100.0 * valid_toks / max(1, total_toks):.3f}%)",
+            flush=True,
+        )
+
+    # teacher-student token overlap
+    if (
+        teacher_topk_indices is not None
+        and input_ids is not None
+        and token_mask is not None
+        and token_mask.shape[1] > 1
+    ):
+        # token_mask[b,t]=1 → position t is a loss token; teacher logit at t predicts token t+1
+        loss_mask_shift = token_mask[:, 1:].bool()   # [B, S-1]
+        student_next = input_ids[:, 1:]              # [B, S-1]
+        teacher_topk_shift = teacher_topk_indices[:, :-1, :]  # [B, S-1, k]
+
+        student_in_topk = (teacher_topk_shift == student_next.unsqueeze(-1)).any(dim=-1)
+        n_loss = int(loss_mask_shift.sum().item())
+        if n_loss > 0:
+            overlap = float((student_in_topk & loss_mask_shift).sum().item()) / n_loss
+            topk = int(teacher_topk_indices.shape[-1])
+            print(
+                f"[SAMPLE DEBUG] student token in teacher top-{topk}: "
+                f"{overlap * 100:.1f}% of {n_loss} loss positions",
+                flush=True,
+            )
+        if teacher_topk_logits is not None and n_loss > 0:
+            top1_logit = teacher_topk_logits[:, :, 0]
+            masked_logits = top1_logit[token_mask.bool()]
+            print(
+                f"[SAMPLE DEBUG] teacher top-1 logit at loss positions: "
+                f"mean={masked_logits.mean().item():.3f}  "
+                f"min={masked_logits.min().item():.3f}  "
+                f"max={masked_logits.max().item():.3f}",
+                flush=True,
+            )
+
+    # per-sample generation lengths
+    message_logs_list = repeated_batch.get("message_log", [])
+    gen_lengths = []
+    for msg_log in message_logs_list:
+        asst_len = sum(
+            int(m["token_ids"].numel())
+            for m in msg_log
+            if isinstance(m.get("token_ids"), torch.Tensor) and m.get("role") == "assistant"
+        )
+        gen_lengths.append(asst_len)
+    if gen_lengths:
+        print(
+            f"[SAMPLE DEBUG] generation length: "
+            f"mean={sum(gen_lengths)/len(gen_lengths):.1f}  "
+            f"min={min(gen_lengths)}  max={max(gen_lengths)}",
+            flush=True,
+        )
+
+    # decoded samples
+    for i in range(min(LOG_NUM_SAMPLES, len(message_logs_list))):
+        print(f"\n[SAMPLE DEBUG] ── Sample {i + 1} ──", flush=True)
+        for msg in message_logs_list[i]:
+            role = msg.get("role", "unknown")
+            tids = msg.get("token_ids")
+            if not isinstance(tids, torch.Tensor):
+                continue
+            decoded = tokenizer.decode(tids.tolist(), skip_special_tokens=False)
+            n_tok = int(tids.numel())
+            if role == "user":
+                display = decoded[:400] + ("…" if len(decoded) > 400 else "")
+                print(
+                    f"[SAMPLE DEBUG] PROMPT ({n_tok} tok, first 400 chars):\n{display}",
+                    flush=True,
+                )
+            elif role == "assistant":
+                if len(decoded) > 800:
+                    display = (
+                        decoded[:500]
+                        + f"\n…[{len(decoded) - 700} chars omitted]…\n"
+                        + decoded[-200:]
+                    )
+                else:
+                    display = decoded
+                print(
+                    f"[SAMPLE DEBUG] RESPONSE ({n_tok} tok):\n{display}",
+                    flush=True,
+                )
+        sm_val = (
+            sample_mask[i].item()
+            if sample_mask is not None and i < len(sample_mask)
+            else "n/a"
+        )
+        print(f"[SAMPLE DEBUG] sample_mask[{i}] = {sm_val}", flush=True)
+
+    print(f"{'#' * 70}\n", flush=True)
+
 
 def _apply_assistant_loss_mask(message_logs: list[Any]) -> None:
     for message_log in message_logs:
@@ -990,6 +1138,15 @@ def distillation_train(
                             )
                         train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                        invalid_samples = []
+
+                _log_debug_samples(
+                    step=total_steps,
+                    tokenizer=tokenizer,
+                    train_data=train_data,
+                    repeated_batch=repeated_batch,
+                    invalid_samples=invalid_samples,
+                )
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
