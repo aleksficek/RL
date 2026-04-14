@@ -968,6 +968,7 @@ class DistillationLossConfig(TypedDict):
     mixed_kl_weight: float
     zero_outside_topk: bool
     teacher_temperature: NotRequired[float]  # softens teacher distribution; 1.0 = no change
+    per_token_kl_clip: NotRequired[float | None]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -987,6 +988,7 @@ class DistillationLossFn(LossFunction):
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.teacher_temperature = float(cfg.get("teacher_temperature", 1.0))  # type: ignore[attr-defined]
+        self.per_token_kl_clip = cfg.get("per_token_kl_clip", None)
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -995,6 +997,8 @@ class DistillationLossFn(LossFunction):
             "Invalid mixed KL weight"
         )
         assert self.teacher_temperature > 0, "teacher_temperature must be positive"
+        if self.per_token_kl_clip is not None:
+            assert self.per_token_kl_clip > 0, "per_token_kl_clip must be positive"
 
     def __call__(
         self,
@@ -1191,6 +1195,13 @@ class DistillationLossFn(LossFunction):
             )
 
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+        clipped_mask = None
+        clipped_token_count = 0.0
+        total_loss_tokens = 0.0
+        if self.per_token_kl_clip is not None:
+            clipped_mask = per_token_kl > self.per_token_kl_clip
+            clipped_token_count = float(clipped_mask.sum().item())
+            per_token_kl = per_token_kl.clamp(min=0.0, max=self.per_token_kl_clip)
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
@@ -1200,6 +1211,11 @@ class DistillationLossFn(LossFunction):
             max_len = per_token_kl.shape[1]
             token_mask = token_mask[:, :max_len]
             mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+            total_loss_tokens = float(mask.sum().item())
+            if clipped_mask is not None:
+                clipped_token_count = float(
+                    (clipped_mask[:, :max_len] & mask.bool()).sum().item()
+                )
             # align mask shape to per_token_kl
             kl_loss = masked_mean(
                 per_token_kl,
@@ -1211,7 +1227,9 @@ class DistillationLossFn(LossFunction):
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": int(batch_size),
+            "num_valid_samples": int((data["sample_mask"] > 0).sum().item()),
+            "distill_clipped_tokens": clipped_token_count,
+            "distill_loss_tokens": total_loss_tokens,
         }
 
         return kl_loss, metrics

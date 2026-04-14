@@ -1,16 +1,34 @@
 defaults: distillation_icpc_qwen3_0_6b_from_1_7b.yaml
 
 distillation:
-  num_prompts_per_step: 32
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 1
+  topk_logits_k: 256
+  rollout_greedy: false
   teacher_update_mode: fixed
   teacher_update_period: 1
+  filter_truncated_rollouts: true
+  truncated_rollout_tolerance: 0.98
+  filter_repetitive_rollouts: true
+  repetition_min_response_tokens: 128
+  repetition_max_token_run: 96
+  repetition_max_token_fraction: 0.5
+  require_code_block: true
+
+loss_fn:
+  kl_type: forward
+  zero_outside_topk: true
+  teacher_temperature: 1.0
+  per_token_kl_clip: 0.05
 
 policy:
   model_name: Qwen/Qwen3-14B
   tokenizer:
     name: ${..model_name}
-  train_global_batch_size: 32
-  generation_batch_size: 32
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 16
+  generation_batch_size: 16
   logprob_batch_size: 1
   dtensor_cfg:
     enabled: false
@@ -20,6 +38,12 @@ policy:
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
   generation:
+    max_new_tokens: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_strings:
+      - "<|im_end|>"
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.8
@@ -28,6 +52,8 @@ teacher:
   model_name: ${policy.model_name}
   tokenizer:
     name: ${..model_name}
+    chat_template_kwargs:
+      enable_thinking: false
   dtensor_cfg:
     enabled: false
   megatron_cfg:

@@ -49,8 +49,8 @@ DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 # ulimit adjustments for Ray
 ulimit -Sn 65535 || echo "Warning: could not set ulimit"
 
-MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-60000}
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-61000}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-65535}
 
 # Ray Env
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
@@ -110,7 +110,15 @@ ray start --head \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --dashboard-host="$head_node_ip" \
-    --block 
+    --node-manager-port=${NODE_MANAGER_PORT} \
+    --object-manager-port=${OBJECT_MANAGER_PORT} \
+    --runtime-env-agent-port=${RUNTIME_ENV_AGENT_PORT} \
+    --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \
+    --metrics-export-port=${METRICS_EXPORT_PORT} \
+    --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
+    --min-worker-port=${MIN_WORKER_PORT} \
+    --max-worker-port=${MAX_WORKER_PORT} \
+    --block
 EOF
 )
 srun $COMMON_SRUN_ARGS --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -c "$head_cmd" &
@@ -121,7 +129,7 @@ SRUN_PIDS["ray-head"]=$!
 ########################################################
 for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
-  worker_cmd="ray start --address $ip_head --resources=\"{\\\"worker_units\\\": $GPUS_PER_NODE}\" --block"
+  worker_cmd="ray start --address $ip_head --resources=\"{\\\"worker_units\\\": $GPUS_PER_NODE}\" --node-manager-port=${NODE_MANAGER_PORT} --object-manager-port=${OBJECT_MANAGER_PORT} --runtime-env-agent-port=${RUNTIME_ENV_AGENT_PORT} --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} --metrics-export-port=${METRICS_EXPORT_PORT} --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} --min-worker-port=${MIN_WORKER_PORT} --max-worker-port=${MAX_WORKER_PORT} --block"
   srun $COMMON_SRUN_ARGS --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -c "$worker_cmd" &
   SRUN_PIDS["ray-worker-$i"]=$!
 done

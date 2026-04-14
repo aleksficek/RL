@@ -21,6 +21,32 @@ logging.basicConfig(
     format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d: %(message)s",
 )
 
+
+def _prepend_repo_path(path: Path) -> None:
+    if not path.exists():
+        return
+
+    path_str = str(path)
+    if path_str in sys.path:
+        sys.path.remove(path_str)
+    sys.path.insert(0, path_str)
+
+
+def _clear_shadowed_package(module_name: str, expected_package_dir: Path) -> None:
+    module = sys.modules.get(module_name)
+    if module is None:
+        return
+
+    module_file = getattr(module, "__file__", None)
+    if module_file:
+        module_path = Path(module_file).resolve()
+        if expected_package_dir == module_path.parent:
+            return
+
+    for loaded_name in list(sys.modules):
+        if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+            sys.modules.pop(loaded_name, None)
+
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
 add Megatron-LM to the python path. This is because the only sub-package
@@ -35,6 +61,13 @@ megatron_path = (
 )
 if megatron_path.exists() and str(megatron_path) not in sys.path:
     sys.path.append(str(megatron_path))
+
+# Prepend the vendored NeMo-Gym checkout so `examples/nemo_gym` does not win as
+# a namespace package when training entrypoints are launched from `examples/`.
+nemo_gym_path = Path(__file__).parent.parent / "3rdparty" / "Gym-workspace" / "Gym"
+if nemo_gym_path.exists():
+    _prepend_repo_path(nemo_gym_path)
+    _clear_shadowed_package("nemo_gym", nemo_gym_path / "nemo_gym")
 
 from nemo_rl.package_info import (
     __contact_emails__,

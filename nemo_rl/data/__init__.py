@@ -35,6 +35,7 @@ class DataConfig(TypedDict):
     seed: NotRequired[int | None]
     download_dir: NotRequired[str]
     train_data_path: NotRequired[str]
+    validation_jsonl_fpath: NotRequired[str]
     val_data_paths: NotRequired[dict[str, str]]
     # Number of data loader workers.
     # Set to 8 or 10 for large batches to improve loading speed.

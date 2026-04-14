@@ -19,14 +19,17 @@ Differences from run_distillation_math.py:
   - The JSONL rows are expected to have the prompt at data.prompt_key
     (default: "responses_create_params.input" for Nemo-Gym ICPC format,
      or a flat top-level key such as "prompt").
-  - No environment-based validation is performed; set val_period: 0 in config.
+  - Validation can optionally use NeMo-Gym reward evaluation when
+    data.validation_jsonl_fpath and env.should_use_nemo_gym are provided.
 """
 
 import argparse
+import json
 import os
 from collections import defaultdict
 from typing import Any, Optional
 
+import ray
 from datasets import load_dataset
 from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
@@ -45,6 +48,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    nemo_gym_example_to_nemo_rl_datum_spec,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -164,6 +173,27 @@ def _extract_nested(
     return value
 
 
+def setup_single_nemo_gym_dataset(jsonl_fpath: str, tokenizer: TokenizerType):
+    with open(jsonl_fpath) as f:
+        nemo_gym_examples = list(map(json.loads, f))
+
+    print(f"  Loading validation data from: {jsonl_fpath}")
+    print(f"  Found {len(nemo_gym_examples)} NeMo-Gym validation examples")
+
+    nemo_rl_compatible_examples: list[DatumSpec] = [
+        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
+        for idx, nemo_gym_example in enumerate(nemo_gym_examples)
+    ]
+
+    passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
+    return AllTaskProcessedDataset(
+        nemo_rl_compatible_examples,
+        tokenizer,
+        None,
+        passthrough_task_processor,
+    )
+
+
 # ===============================================================================
 #                             Data Setup
 # ===============================================================================
@@ -233,11 +263,16 @@ def setup_data(
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    # Validation is disabled for code tasks (requires sandbox execution).
-    # Set distillation.val_period: 0 in config to skip validation entirely.
     val_dataset = None
+    validation_jsonl_fpath = data_config.get("validation_jsonl_fpath")
+    if validation_jsonl_fpath:
+        val_dataset = setup_single_nemo_gym_dataset(
+            validation_jsonl_fpath,
+            tokenizer,
+        )
 
-    # Use MathEnvironment as a placeholder; it is only invoked if val_period > 0.
+    # Keep the existing training behavior unchanged by leaving the train-side
+    # environment as the lightweight placeholder.
     math_env_cfg = env_configs.get("math", {"num_workers": 1})
     dummy_env = MathEnvironment.options(  # type: ignore
         runtime_env={
@@ -288,6 +323,28 @@ def main() -> None:
     init_ray()
 
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    validation_enabled = bool(
+        config["distillation"].get("val_period", 0) > 0
+        or config["distillation"].get("val_at_start", False)
+    )
+    should_use_nemo_gym_validation = bool(
+        validation_enabled
+        and config.get("env", {}).get("should_use_nemo_gym")
+        and config.get("data", {}).get("validation_jsonl_fpath")
+    )
+    if (
+        validation_enabled
+        and config.get("data", {}).get("validation_jsonl_fpath")
+        and not should_use_nemo_gym_validation
+    ):
+        raise ValueError(
+            "Code validation JSONL requires env.should_use_nemo_gym=true "
+            "and env.nemo_gym to be configured."
+        )
+    if should_use_nemo_gym_validation:
+        print("▶ Enabling NeMo-Gym-backed validation for code distillation...")
+    if should_use_nemo_gym_validation:
+        setup_nemo_gym_config(config, tokenizer)
 
     if config["policy"]["generation"] is not None:
         config["policy"]["generation"] = configure_generation_config(
@@ -299,6 +356,11 @@ def main() -> None:
     dataset, val_dataset, task_to_env, val_task_to_env = setup_data(
         tokenizer, config["data"], config["env"], 42
     )
+    if val_dataset is not None:
+        if config["distillation"]["max_val_samples"] <= 0:
+            config["distillation"]["max_val_samples"] = len(val_dataset)
+        if config["distillation"]["val_batch_size"] <= 0:
+            config["distillation"]["val_batch_size"] = len(val_dataset)
 
     (
         student_policy,
@@ -312,6 +374,29 @@ def main() -> None:
         distillation_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
+    if should_use_nemo_gym_validation:
+        assert student_generation is not None, (
+            "NeMo-Gym validation requires a generation interface."
+        )
+        assert hasattr(student_generation, "dp_openai_server_base_urls"), (
+            "NeMo-Gym validation requires vLLM async generation with exposed HTTP servers."
+        )
+        print("\n▶ Setting up NeMo-Gym validation environment...")
+        nemo_gym_config = NemoGymConfig(
+            model_name=student_generation.cfg["model_name"],
+            base_urls=student_generation.dp_openai_server_base_urls,
+            initial_global_config_dict=config["env"]["nemo_gym"],
+        )
+        nemo_gym = NemoGym.options(
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.nemo_gym.NemoGym"
+                ),
+            }
+        ).remote(nemo_gym_config)
+        ray.get(nemo_gym.health_check.remote())
+        val_task_to_env = {"nemo_gym": nemo_gym}
 
     distillation_train(
         student_policy,

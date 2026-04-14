@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import json
+import math
 import os
 import warnings
 from copy import deepcopy
@@ -46,6 +48,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    run_async_nemo_gym_rollout,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
@@ -75,6 +78,14 @@ class DistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
     num_generations_per_prompt: int
+    rollout_greedy: NotRequired[bool]
+    filter_truncated_rollouts: NotRequired[bool]
+    truncated_rollout_tolerance: NotRequired[float]
+    filter_repetitive_rollouts: NotRequired[bool]
+    repetition_min_response_tokens: NotRequired[int]
+    repetition_max_token_run: NotRequired[int]
+    repetition_max_token_fraction: NotRequired[float]
+    require_code_block: NotRequired[bool]
     max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: int  # maximum number of steps to train for
     max_num_epochs: int  # maximum number of epochs to train for
@@ -555,6 +566,19 @@ def setup(
 
 LOG_SAMPLE_PERIOD = 1  # log debug samples every N steps (set to 0 to disable)
 LOG_NUM_SAMPLES = 2    # number of decoded samples to print per debug step
+ROLLOUT_VERIFICATION_APPEND_FAILED = False
+CODE_LIKE_MARKERS = (
+    "```",
+    "```cpp",
+    "```c++",
+    "#include",
+    "int main(",
+    "using namespace std",
+    "std::",
+    "vector<",
+    "cin >>",
+    "cout <<",
+)
 
 
 def _log_debug_samples(
@@ -712,6 +736,348 @@ def _apply_assistant_loss_mask(message_logs: list[Any]) -> None:
                 message["token_loss_mask"] = torch.ones_like(token_ids)
             else:
                 message["token_loss_mask"] = torch.zeros_like(token_ids)
+
+
+def _get_last_assistant_message(
+    message_log: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    for message in reversed(message_log):
+        if message.get("role") == "assistant":
+            return message
+    return None
+
+
+def _message_to_text(
+    message: dict[str, Any], tokenizer: TokenizerType
+) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    token_ids = message.get("token_ids")
+    if isinstance(token_ids, torch.Tensor):
+        return tokenizer.decode(token_ids.tolist(), skip_special_tokens=False)
+    return ""
+
+
+def _message_log_to_role_texts(
+    message_log: list[dict[str, Any]],
+    tokenizer: TokenizerType,
+    role: str,
+) -> list[str]:
+    texts: list[str] = []
+    for message in message_log:
+        if message.get("role") != role:
+            continue
+        text = _message_to_text(message, tokenizer)
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _get_rollout_verification_log_path() -> Path:
+    override_path = os.getenv("NRL_DISTILL_VERIFY_JSONL")
+    if override_path:
+        return Path(override_path).expanduser()
+
+    job_id = os.getenv("SLURM_JOB_ID", "local")
+    return Path(os.getcwd()) / f"{job_id}-logs" / "ccc_verify.jsonl"
+
+
+def _code_like_markers_present(text: str) -> list[str]:
+    return [marker for marker in CODE_LIKE_MARKERS if marker in text]
+
+
+def _token_repetition_stats(token_ids: torch.Tensor) -> tuple[int, float]:
+    if token_ids.numel() <= 0:
+        return 0, 0.0
+
+    max_run = 1
+    current_run = 1
+    prev_token = int(token_ids[0].item())
+    for token in token_ids[1:]:
+        token_value = int(token.item())
+        if token_value == prev_token:
+            current_run += 1
+            if current_run > max_run:
+                max_run = current_run
+        else:
+            current_run = 1
+            prev_token = token_value
+
+    _, counts = torch.unique(token_ids, return_counts=True)
+    dominant_fraction = float(counts.max().item()) / float(token_ids.numel())
+    return max_run, dominant_fraction
+
+
+def _filter_pathological_rollouts(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    distillation_config: DistillationConfig,
+    generation_max_new_tokens: int,
+) -> dict[str, float]:
+    sample_mask = repeated_batch.get("loss_multiplier")
+    message_logs = repeated_batch.get("message_log")
+    if not isinstance(sample_mask, torch.Tensor) or not isinstance(message_logs, list):
+        return {}
+
+    filter_truncated = bool(distillation_config.get("filter_truncated_rollouts", False))
+    truncated_tolerance = float(
+        distillation_config.get("truncated_rollout_tolerance", 0.98)
+    )
+    filter_repetitive = bool(
+        distillation_config.get("filter_repetitive_rollouts", False)
+    )
+    repetition_min_tokens = int(
+        distillation_config.get("repetition_min_response_tokens", 128)
+    )
+    repetition_max_run = int(distillation_config.get("repetition_max_token_run", 96))
+    repetition_max_fraction = float(
+        distillation_config.get("repetition_max_token_fraction", 0.25)
+    )
+    require_code_block = bool(distillation_config.get("require_code_block", False))
+
+    filtered_truncated = 0
+    filtered_repetitive = 0
+    filtered_missing_code = 0
+    filtered_missing_assistant = 0
+
+    for sample_idx, message_log in enumerate(message_logs):
+        if sample_idx >= len(sample_mask) or float(sample_mask[sample_idx].item()) <= 0:
+            continue
+
+        assistant_message = _get_last_assistant_message(message_log)
+        if assistant_message is None:
+            sample_mask[sample_idx] = 0
+            filtered_missing_assistant += 1
+            continue
+
+        token_ids = assistant_message.get("token_ids")
+        response_len = int(token_ids.numel()) if isinstance(token_ids, torch.Tensor) else 0
+        if (
+            filter_truncated
+            and generation_max_new_tokens > 0
+            and response_len >= max(1, int(truncated_tolerance * generation_max_new_tokens))
+        ):
+            sample_mask[sample_idx] = 0
+            filtered_truncated += 1
+            continue
+
+        if filter_repetitive and isinstance(token_ids, torch.Tensor):
+            max_run, dominant_fraction = _token_repetition_stats(token_ids)
+            if (
+                response_len >= repetition_min_tokens
+                and (
+                    max_run >= repetition_max_run
+                    or dominant_fraction >= repetition_max_fraction
+                )
+            ):
+                sample_mask[sample_idx] = 0
+                filtered_repetitive += 1
+                continue
+
+        if require_code_block:
+            response_text = _message_to_text(assistant_message, tokenizer)
+            if "```" not in response_text:
+                sample_mask[sample_idx] = 0
+                filtered_missing_code += 1
+
+    filtered_total = (
+        filtered_truncated
+        + filtered_repetitive
+        + filtered_missing_code
+        + filtered_missing_assistant
+    )
+    if filtered_total > 0:
+        total_samples = int(sample_mask.numel())
+        valid_after_filter = int((sample_mask > 0).sum().item())
+        print(
+            "⚠️ Filtered rollout targets before distillation: "
+            f"{filtered_total}/{total_samples} "
+            f"(truncated={filtered_truncated}, repetitive={filtered_repetitive}, "
+            f"missing_code={filtered_missing_code}, missing_assistant={filtered_missing_assistant}).",
+            flush=True,
+        )
+        return {
+            "filtered_rollouts": float(filtered_total),
+            "filtered_rollouts_truncated": float(filtered_truncated),
+            "filtered_rollouts_repetitive": float(filtered_repetitive),
+            "filtered_rollouts_missing_code": float(filtered_missing_code),
+            "filtered_rollouts_missing_assistant": float(filtered_missing_assistant),
+            "valid_rollouts_after_filter": float(valid_after_filter),
+        }
+
+    return {
+        "filtered_rollouts": 0.0,
+        "filtered_rollouts_truncated": 0.0,
+        "filtered_rollouts_repetitive": 0.0,
+        "filtered_rollouts_missing_code": 0.0,
+        "filtered_rollouts_missing_assistant": 0.0,
+        "valid_rollouts_after_filter": float((sample_mask > 0).sum().item()),
+    }
+
+
+def _build_rollout_verification_rows(
+    *,
+    step: int,
+    tokenizer: TokenizerType,
+    repeated_batch: BatchedDataDict[DatumSpec],
+    distillation_config: DistillationConfig,
+    generation_max_new_tokens: int,
+    sample_mask_before_rollout_filters: Optional[torch.Tensor],
+    sample_mask_after_rollout_filters: Optional[torch.Tensor],
+    final_sample_mask: Optional[torch.Tensor],
+    invalid_samples: list[int],
+) -> list[dict[str, Any]]:
+    message_logs = repeated_batch.get("message_log")
+    if not isinstance(message_logs, list):
+        return []
+
+    filter_truncated = bool(distillation_config.get("filter_truncated_rollouts", False))
+    truncated_tolerance = float(
+        distillation_config.get("truncated_rollout_tolerance", 0.98)
+    )
+    filter_repetitive = bool(
+        distillation_config.get("filter_repetitive_rollouts", False)
+    )
+    repetition_min_tokens = int(
+        distillation_config.get("repetition_min_response_tokens", 128)
+    )
+    repetition_max_run = int(distillation_config.get("repetition_max_token_run", 96))
+    repetition_max_fraction = float(
+        distillation_config.get("repetition_max_token_fraction", 0.25)
+    )
+    require_code_block = bool(distillation_config.get("require_code_block", False))
+    invalid_sample_set = set(invalid_samples)
+    teacher_prompt_message_logs = repeated_batch.get("teacher_message_log")
+
+    rows: list[dict[str, Any]] = []
+    for sample_idx, message_log in enumerate(message_logs):
+        prompt_texts = _message_log_to_role_texts(message_log, tokenizer, "user")
+        assistant_texts = _message_log_to_role_texts(message_log, tokenizer, "assistant")
+        teacher_prompt_texts: list[str] = []
+        if (
+            isinstance(teacher_prompt_message_logs, list)
+            and sample_idx < len(teacher_prompt_message_logs)
+            and isinstance(teacher_prompt_message_logs[sample_idx], list)
+        ):
+            teacher_prompt_texts = _message_log_to_role_texts(
+                teacher_prompt_message_logs[sample_idx], tokenizer, "user"
+            )
+
+        assistant_message = _get_last_assistant_message(message_log)
+        response_text = (
+            _message_to_text(assistant_message, tokenizer)
+            if assistant_message is not None
+            else ""
+        )
+        token_ids = assistant_message.get("token_ids") if assistant_message else None
+        response_len = int(token_ids.numel()) if isinstance(token_ids, torch.Tensor) else 0
+
+        truncated = bool(
+            assistant_message is not None
+            and filter_truncated
+            and generation_max_new_tokens > 0
+            and response_len
+            >= max(1, int(truncated_tolerance * generation_max_new_tokens))
+        )
+        repetitive = False
+        max_run = 0
+        dominant_fraction = 0.0
+        if assistant_message is not None and filter_repetitive and isinstance(
+            token_ids, torch.Tensor
+        ):
+            max_run, dominant_fraction = _token_repetition_stats(token_ids)
+            repetitive = bool(
+                response_len >= repetition_min_tokens
+                and (
+                    max_run >= repetition_max_run
+                    or dominant_fraction >= repetition_max_fraction
+                )
+            )
+
+        code_like_markers = _code_like_markers_present(response_text)
+        has_code_block = "```" in response_text
+        missing_code = bool(
+            assistant_message is not None and require_code_block and not has_code_block
+        )
+
+        filter_reasons: list[str] = []
+        if assistant_message is None:
+            filter_reasons.append("missing_assistant")
+        else:
+            if truncated:
+                filter_reasons.append("truncated")
+            if repetitive:
+                filter_reasons.append("repetitive")
+            if missing_code:
+                filter_reasons.append("missing_code")
+        if sample_idx in invalid_sample_set:
+            filter_reasons.append("teacher_student_token_count_mismatch")
+
+        rows.append(
+            {
+                "step": step + 1,
+                "sample_idx": sample_idx,
+                "loss_multiplier_before_rollout_filters": (
+                    float(sample_mask_before_rollout_filters[sample_idx].item())
+                    if sample_mask_before_rollout_filters is not None
+                    and sample_idx < len(sample_mask_before_rollout_filters)
+                    else None
+                ),
+                "loss_multiplier_after_rollout_filters": (
+                    float(sample_mask_after_rollout_filters[sample_idx].item())
+                    if sample_mask_after_rollout_filters is not None
+                    and sample_idx < len(sample_mask_after_rollout_filters)
+                    else None
+                ),
+                "loss_multiplier_final": (
+                    float(final_sample_mask[sample_idx].item())
+                    if final_sample_mask is not None and sample_idx < len(final_sample_mask)
+                    else None
+                ),
+                "filter_reasons": filter_reasons,
+                "had_assistant_message": assistant_message is not None,
+                "invalid_teacher_alignment": sample_idx in invalid_sample_set,
+                "response_token_count": response_len,
+                "generation_max_new_tokens": generation_max_new_tokens,
+                "requires_code_block": require_code_block,
+                "has_code_block": has_code_block,
+                "code_fence_count": response_text.count("```"),
+                "code_like_markers": code_like_markers,
+                "looks_like_code": len(code_like_markers) > 0,
+                "max_repeated_token_run": max_run,
+                "dominant_token_fraction": dominant_fraction,
+                "prompt_text": "\n\n".join(prompt_texts),
+                "teacher_prompt_text": "\n\n".join(teacher_prompt_texts),
+                "response_text": response_text,
+                "assistant_texts": assistant_texts,
+            }
+        )
+
+    return rows
+
+
+def _append_rollout_verification_rows(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+) -> None:
+    global ROLLOUT_VERIFICATION_APPEND_FAILED
+    if not rows:
+        return
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+    except OSError as exc:
+        if not ROLLOUT_VERIFICATION_APPEND_FAILED:
+            print(
+                "⚠️ Failed to append rollout verification rows to "
+                f"{output_path}: {exc}",
+                flush=True,
+            )
+            ROLLOUT_VERIFICATION_APPEND_FAILED = True
 
 
 def _trim_teacher_prompt_prefix(
@@ -893,9 +1259,11 @@ def distillation_train(
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    generation_max_new_tokens = int(master_config["policy"]["generation"]["max_new_tokens"])
     teacher_update_mode = _get_teacher_update_mode(master_config["distillation"])
     teacher_update_period = _get_teacher_update_period(master_config["distillation"])
     use_reference_teacher = teacher_update_mode == "periodic_sync"
+    rollout_greedy = bool(master_config["distillation"].get("rollout_greedy", False))
     max_epochs = master_config["distillation"][
         "max_num_epochs"
     ]  # max number of epochs to train for
@@ -911,6 +1279,14 @@ def distillation_train(
         raise ValueError("A teacher policy is required when teacher_update_mode=fixed.")
 
     student_policy_with_reference = cast(Any, student_policy)
+    warned_teacher_conditioned_topk = False
+    warned_generation_cap = False
+    rollout_verification_log_path = _get_rollout_verification_log_path()
+    print(
+        "▶ Rollout verification samples will be appended to "
+        f"{rollout_verification_log_path}",
+        flush=True,
+    )
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -954,6 +1330,10 @@ def distillation_train(
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
+                rollout_filter_metrics: dict[str, float] = {}
+                sample_mask_before_rollout_filters: Optional[torch.Tensor] = None
+                sample_mask_after_rollout_filters: Optional[torch.Tensor] = None
+
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
@@ -998,7 +1378,7 @@ def distillation_train(
                             max_rollout_turns=master_config["distillation"][
                                 "max_rollout_turns"
                             ],
-                            greedy=False,
+                            greedy=rollout_greedy,
                         )
                     else:
                         repeated_batch, rollout_metrics = run_multi_turn_rollout(
@@ -1012,13 +1392,25 @@ def distillation_train(
                             max_rollout_turns=master_config["distillation"][
                                 "max_rollout_turns"
                             ],
-                            greedy=False,
+                            greedy=rollout_greedy,
                         )
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     _apply_assistant_loss_mask(repeated_batch["message_log"])
+                    sample_mask_before_rollout_filters = (
+                        repeated_batch["loss_multiplier"].detach().clone().cpu()
+                    )
+                    rollout_filter_metrics = _filter_pathological_rollouts(
+                        repeated_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        distillation_config=master_config["distillation"],
+                        generation_max_new_tokens=generation_max_new_tokens,
+                    )
+                    sample_mask_after_rollout_filters = (
+                        repeated_batch["loss_multiplier"].detach().clone().cpu()
+                    )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1060,6 +1452,18 @@ def distillation_train(
                     )
 
                     if use_teacher_conditioned_prompts:
+                        if (
+                            not master_config["loss_fn"].get("zero_outside_topk", False)
+                            and not warned_teacher_conditioned_topk
+                        ):
+                            print(
+                                "⚠️ Teacher-conditioned distillation is using "
+                                "zero_outside_topk=false. Because teacher logits are "
+                                "top-k only, probability mass outside the transmitted "
+                                "support can drift and distort the KL target.",
+                                flush=True,
+                            )
+                            warned_teacher_conditioned_topk = True
                         teacher_message_logs = _build_teacher_rollout_message_logs(
                             student_message_logs=repeated_batch["message_log"],
                             teacher_prompt_message_logs=teacher_prompt_message_logs,
@@ -1140,6 +1544,22 @@ def distillation_train(
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
                         invalid_samples = []
 
+                rollout_verification_rows = _build_rollout_verification_rows(
+                    step=total_steps,
+                    tokenizer=tokenizer,
+                    repeated_batch=repeated_batch,
+                    distillation_config=master_config["distillation"],
+                    generation_max_new_tokens=generation_max_new_tokens,
+                    sample_mask_before_rollout_filters=sample_mask_before_rollout_filters,
+                    sample_mask_after_rollout_filters=sample_mask_after_rollout_filters,
+                    final_sample_mask=train_data.get("sample_mask"),
+                    invalid_samples=invalid_samples,
+                )
+                _append_rollout_verification_rows(
+                    rollout_verification_rows,
+                    rollout_verification_log_path,
+                )
+
                 _log_debug_samples(
                     step=total_steps,
                     tokenizer=tokenizer,
@@ -1147,30 +1567,69 @@ def distillation_train(
                     repeated_batch=repeated_batch,
                     invalid_samples=invalid_samples,
                 )
-
-                print("▶ Preparing for training...", flush=True)
-                with timer.time("training_prep"):
-                    if teacher_policy is not None:
-                        teacher_policy.offload_after_refit()
-                    student_policy.prepare_for_training()  # set model train and reload optim to GPU
-                    POLICY_GENERATION_STALE = True
-
-                print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
-                    train_results = student_policy.train(train_data, loss_fn)
-                teacher_sync_performed = 0.0
                 if (
-                    use_reference_teacher
-                    and (total_steps + 1) % teacher_update_period == 0
+                    generation_max_new_tokens > 0
+                    and rollout_metrics["max_gen_tokens_per_sample"]
+                    >= 0.9 * generation_max_new_tokens
+                    and not warned_generation_cap
                 ):
-                    with timer.time("teacher_sync"):
-                        student_policy_with_reference.sync_reference_model_from_current_model()
-                    teacher_sync_performed = 1.0
                     print(
-                        "▶ Synced reference teacher from student weights "
-                        f"at step {total_steps + 1}.",
+                        "⚠️ On-policy rollouts are reaching the configured generation cap "
+                        f"({rollout_metrics['max_gen_tokens_per_sample']:.0f}/"
+                        f"{generation_max_new_tokens} tokens). Those truncated "
+                        "continuations become distillation targets and often cause "
+                        "loss/quality divergence. Lower policy.generation.max_new_tokens, "
+                        "lower sampling temperature, or add stronger stop strings.",
                         flush=True,
                     )
+                    warned_generation_cap = True
+
+                teacher_sync_performed = 0.0
+                valid_rollouts_after_filter = int(
+                    (repeated_batch["loss_multiplier"] > 0).sum().item()
+                )
+                if valid_rollouts_after_filter == 0:
+                    print(
+                        "⚠️ All rollout targets were filtered before distillation. "
+                        "Skipping the student update for this step.",
+                        flush=True,
+                    )
+                    if teacher_policy is not None:
+                        teacher_policy.offload_after_refit()
+                    train_results = {
+                        "loss": torch.tensor(0.0),
+                        "grad_norm": torch.tensor(0.0),
+                        "all_mb_metrics": {
+                            "num_valid_samples": [0.0],
+                            "global_valid_seqs": [0.0],
+                            "global_valid_toks": [0.0],
+                            "distill_clipped_tokens": [0.0],
+                            "distill_loss_tokens": [0.0],
+                        },
+                    }
+                else:
+                    print("▶ Preparing for training...", flush=True)
+                    with timer.time("training_prep"):
+                        if teacher_policy is not None:
+                            teacher_policy.offload_after_refit()
+                        student_policy.prepare_for_training()  # set model train and reload optim to GPU
+                        POLICY_GENERATION_STALE = True
+
+                    print("▶ Training policy...", flush=True)
+                    with timer.time("policy_training"):
+                        train_results = student_policy.train(train_data, loss_fn)
+                    if (
+                        use_reference_teacher
+                        and (total_steps + 1) % teacher_update_period == 0
+                    ):
+                        with timer.time("teacher_sync"):
+                            student_policy_with_reference.sync_reference_model_from_current_model()
+                        teacher_sync_performed = 1.0
+                        print(
+                            "▶ Synced reference teacher from student weights "
+                            f"at step {total_steps + 1}.",
+                            flush=True,
+                        )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -1221,7 +1680,16 @@ def distillation_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                metrics.update(rollout_filter_metrics)
                 metrics["teacher_sync_performed"] = teacher_sync_performed
+                if metrics.get("distill_loss_tokens", 0.0) > 0:
+                    metrics["distill_clip_fraction"] = (
+                        metrics["distill_clipped_tokens"] / metrics["distill_loss_tokens"]
+                    )
+                if repeated_batch.size > 0:
+                    metrics["filtered_rollouts_fraction"] = (
+                        metrics["filtered_rollouts"] / float(repeated_batch.size)
+                    )
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1424,17 +1892,39 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
+        max_val_samples = master_config["distillation"]["max_val_samples"]
+        val_batch_size = master_config["distillation"]["val_batch_size"]
+        max_batches: Optional[int] = None
+        if max_val_samples > 0 and val_batch_size > 0:
+            max_batches = max(1, math.ceil(max_val_samples / val_batch_size))
+
         for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+            if max_batches is not None and batch_idx >= max_batches:
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
+            # NeMo-Gym validation uses the HTTP-served vLLM endpoint and returns rewards
+            # directly from the external environment.
+            if "nemo_gym" in val_task_to_env:
+                generation_config = deepcopy(master_config["policy"]["generation"])
+                # NeMo-Gym validation goes through the OpenAI-compatible HTTP path,
+                # so strip generation knobs that are only supported by direct vLLM use.
+                generation_config["stop_strings"] = None
+                generation_config["stop_token_ids"] = []
+                generation_config["top_k"] = 0
+                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=None,
+                    generation_config=generation_config,
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
+            elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
