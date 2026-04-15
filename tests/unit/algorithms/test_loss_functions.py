@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 from copy import deepcopy
 
 import pytest
@@ -1806,6 +1807,78 @@ def test_distillation_loss_zero_outside_topk():
             assert loss.item() != 0.0  # Should have some meaningful loss
 
 
+def test_distillation_loss_pointwise_clipping():
+    """Test paper-style pointwise clipping before summing KL contributions."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    tau = 1.0
+
+    data = {
+        "input_ids": torch.tensor([[0, 1, 0]], device=device),
+        "input_lengths": torch.tensor([3], device=device),
+        "token_mask": torch.ones((1, 3), device=device),
+        "sample_mask": torch.ones(1, device=device),
+        "teacher_topk_logits": torch.zeros((1, 3, 2), device=device),
+        "teacher_topk_indices": torch.tensor(
+            [[[0, 1], [0, 1], [0, 1]]], device=device
+        ),
+    }
+    student_logits = torch.tensor(
+        [
+            [
+                [math.log(99.0), 0.0],
+                [math.log(99.0), 0.0],
+                [0.0, 0.0],
+            ]
+        ],
+        device=device,
+    )
+
+    common_cfg = {
+        "kl_type": "forward",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+        "per_token_kl_clip": tau,
+    }
+    global_valid_toks = torch.sum(
+        data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+    )
+
+    token_loss_fn = DistillationLossFn({**common_cfg, "kl_clip_mode": "token"})
+    pointwise_loss_fn = DistillationLossFn(
+        {**common_cfg, "kl_clip_mode": "pointwise"}
+    )
+
+    token_loss, token_metrics = token_loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+    pointwise_loss, pointwise_metrics = pointwise_loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+
+    teacher_logprobs = torch.log_softmax(data["teacher_topk_logits"][:, :-1, :], dim=-1)
+    teacher_probs = teacher_logprobs.exp()
+    student_logprobs = torch.log_softmax(student_logits[:, :-1, :], dim=-1)
+    pointwise_terms = teacher_probs * (teacher_logprobs - student_logprobs)
+
+    expected_token_loss = pointwise_terms.sum(dim=-1).clamp(min=0.0, max=tau).mean()
+    expected_pointwise_loss = pointwise_terms.clamp(max=tau).sum(dim=-1).mean()
+
+    torch.testing.assert_close(token_loss, expected_token_loss)
+    torch.testing.assert_close(pointwise_loss, expected_pointwise_loss)
+    assert pointwise_loss < token_loss
+    assert token_metrics["distill_clipped_tokens"] == 2.0
+    assert pointwise_metrics["distill_clipped_tokens"] == 2.0
+
+
 def test_distillation_loss_gradient_flow():
     """Test gradient flow in distillation loss function."""
     data, student_logits = setup_distillation_test_data()
@@ -1904,17 +1977,20 @@ def test_distillation_loss_fn_initialization():
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
     assert not loss_fn.zero_outside_topk
+    assert loss_fn.kl_clip_mode == "token"
 
     # Test with custom values
     custom_config = {
         "kl_type": "reverse",
         "mixed_kl_weight": 0.3,
         "zero_outside_topk": True,
+        "kl_clip_mode": "pointwise",
     }
     loss_fn = DistillationLossFn(custom_config)
     assert loss_fn.kl_type == "reverse"
     assert loss_fn.mixed_kl_weight == 0.3
     assert loss_fn.zero_outside_topk
+    assert loss_fn.kl_clip_mode == "pointwise"
 
 
 def test_distillation_loss_fn_call():

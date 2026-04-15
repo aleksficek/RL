@@ -969,6 +969,7 @@ class DistillationLossConfig(TypedDict):
     zero_outside_topk: bool
     teacher_temperature: NotRequired[float]  # softens teacher distribution; 1.0 = no change
     per_token_kl_clip: NotRequired[float | None]
+    kl_clip_mode: NotRequired[str]  # "token" (legacy) or "pointwise" (paper-style)
 
 
 class DistillationLossDataDict(TypedDict):
@@ -989,6 +990,7 @@ class DistillationLossFn(LossFunction):
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.teacher_temperature = float(cfg.get("teacher_temperature", 1.0))  # type: ignore[attr-defined]
         self.per_token_kl_clip = cfg.get("per_token_kl_clip", None)
+        self.kl_clip_mode = cfg.get("kl_clip_mode", "token")
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -996,6 +998,7 @@ class DistillationLossFn(LossFunction):
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        assert self.kl_clip_mode in ["token", "pointwise"], "Invalid kl_clip_mode"
         assert self.teacher_temperature > 0, "teacher_temperature must be positive"
         if self.per_token_kl_clip is not None:
             assert self.per_token_kl_clip > 0, "per_token_kl_clip must be positive"
@@ -1178,30 +1181,43 @@ class DistillationLossFn(LossFunction):
                 )
 
         if self.kl_type == "forward":
-            per_token_kl = teacher_probs * (
+            pointwise_kl = teacher_probs * (
                 teacher_topk_logprobs - student_topk_logprobs
             )
         elif self.kl_type == "reverse":
-            per_token_kl = student_probs * (
+            pointwise_kl = student_probs * (
                 student_topk_logprobs - teacher_topk_logprobs
             )
         else:
             # mixed KL
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
             kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-            per_token_kl = (
+            pointwise_kl = (
                 self.mixed_kl_weight * kl_forward
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
-        clipped_mask = None
+        token_clipped_mask = None
         clipped_token_count = 0.0
         total_loss_tokens = 0.0
         if self.per_token_kl_clip is not None:
-            clipped_mask = per_token_kl > self.per_token_kl_clip
-            clipped_token_count = float(clipped_mask.sum().item())
-            per_token_kl = per_token_kl.clamp(min=0.0, max=self.per_token_kl_clip)
+            if self.kl_clip_mode == "pointwise":
+                # Paper-style clipping upper-bounds each vocabulary contribution
+                # before summing them into a token-level divergence.
+                clipped_contrib_mask = pointwise_kl > self.per_token_kl_clip
+                token_clipped_mask = clipped_contrib_mask.any(dim=-1)
+                clipped_token_count = float(token_clipped_mask.sum().item())
+                pointwise_kl = pointwise_kl.clamp(max=self.per_token_kl_clip)
+                per_token_kl = pointwise_kl.sum(dim=-1) + loss_correction_term
+            else:
+                per_token_kl = pointwise_kl.sum(dim=-1) + loss_correction_term
+                token_clipped_mask = per_token_kl > self.per_token_kl_clip
+                clipped_token_count = float(token_clipped_mask.sum().item())
+                per_token_kl = per_token_kl.clamp(
+                    min=0.0, max=self.per_token_kl_clip
+                )
+        else:
+            per_token_kl = pointwise_kl.sum(dim=-1) + loss_correction_term
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
@@ -1212,9 +1228,9 @@ class DistillationLossFn(LossFunction):
             token_mask = token_mask[:, :max_len]
             mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
             total_loss_tokens = float(mask.sum().item())
-            if clipped_mask is not None:
+            if token_clipped_mask is not None:
                 clipped_token_count = float(
-                    (clipped_mask[:, :max_len] & mask.bool()).sum().item()
+                    (token_clipped_mask[:, :max_len] & mask.bool()).sum().item()
                 )
             # align mask shape to per_token_kl
             kl_loss = masked_mean(

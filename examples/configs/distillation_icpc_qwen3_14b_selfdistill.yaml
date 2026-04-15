@@ -20,6 +20,7 @@ loss_fn:
   zero_outside_topk: true
   teacher_temperature: 1.0
   per_token_kl_clip: 0.05
+  kl_clip_mode: pointwise
 
 policy:
   model_name: Qwen/Qwen3-14B
